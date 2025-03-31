@@ -65,9 +65,11 @@ public class ShellyPro3EM extends Shelly {
 
   private ActorRef<Datagram> udpOutput = null;
   
-  private Rpc.WsGetConfigResponse wsConfig = new Rpc.WsGetConfigResponse(false, Rpc.RpcStringOrNull.of(null), "*");
+  private Rpc.CloudGetConfigResponse cloudConfig = new Rpc.CloudGetConfigResponse(true, Rpc.RpcStringOrNull.of(null));
+  private Rpc.WsGetConfigResponse wsConfig = new Rpc.WsGetConfigResponse(getConfig().getConfig("ws"));
   private InetAddress outboundWebsocketAddress = null;
   private String outboundWebsocketConnectionId = null;
+  private boolean outboundWebsocketFailure = false;
 
   /**
    * Static setup method
@@ -94,15 +96,20 @@ public class ShellyPro3EM extends Shelly {
     controller.tell(new UniMeter.RegisterHttpRoute(getBindInterface(), getBindPort(), createRoute()));
     
     startUdpServer();
+
+    startOutboundWebsocketConnection();
   }
 
   @Override
   public @NotNull ReceiveBuilder<Command> newReceiveBuilder() {
     return super.newReceiveBuilder()
+          .onMessage(CloudGetConfig.class, this::onCloudGetConfig)
+          .onMessage(CloudSetConfig.class, this::onCloudSetConfig)
           .onMessage(EmGetConfig.class, this::onEmGetConfig)
           .onMessage(EmGetStatus.class, this::onEmGetStatus)
           .onMessage(EmDataGetStatus.class, this::onEmDataGetStatus)
           .onMessage(ResetData.class, this::onResetData)
+          .onMessage(ShellyGetConfig.class, this::onShellyGetConfig)
           .onMessage(ShellyGetDeviceInfo.class, this::onShellyGetDeviceInfo)
           .onMessage(ShellyGetStatus.class, this::onShellyGetStatus)
           .onMessage(ShellyReboot.class, this::onShellyReboot)
@@ -247,6 +254,17 @@ public class ShellyPro3EM extends Shelly {
   }
 
   /**
+   * Handle the Shelly.GetConfig request
+   */
+  protected @NotNull Behavior<Command> onShellyGetConfig(@NotNull ShellyGetConfig request) {
+    logger.trace("ShellyPro3EM.onShellyGetConfig()");
+
+    request.replyTo().tell(rpcShellyGetConfig(request.remoteAddress()));
+
+    return Behaviors.same();
+  }
+
+  /**
    * Handle the 
    */
   protected @NotNull Behavior<Command> onShellyGetDeviceInfo(@NotNull ShellyGetDeviceInfo request) {
@@ -296,6 +314,34 @@ public class ShellyPro3EM extends Shelly {
     return Behaviors.same();
   }
 
+  /**
+   * Handle the Cloud.GetConfig HTTP request
+   * @param request Request to get the device's configuration
+   * @return Same behavior
+   */
+  protected @NotNull Behavior<Command> onCloudGetConfig(@NotNull CloudGetConfig request) {
+    logger.trace("ShellyPro3EM.onCloudGetConfig()");
+
+    request.replyTo().tell(rpcCloudGetConfig());
+
+    return Behaviors.same();
+  }
+
+  /**
+   * Handle the Cloud.SetConfig HTTP request
+   * @param request Request to get the device's configuration
+   * @return Same behavior
+   */
+  protected @NotNull Behavior<Command> onCloudSetConfig(@NotNull CloudSetConfig request) {
+    logger.trace("ShellyPro3EM.onCloudSetConfig()");
+
+    cloudSetConfig(request.config());
+
+    request.replyTo().tell(new Rpc.CloudSetConfigResponse(true));
+
+    return Behaviors.same();
+  }
+  
   /**
    * Handle the Ws.GetConfig HTTP request
    * @param request Request to get the device's configuration
@@ -403,6 +449,8 @@ public class ShellyPro3EM extends Shelly {
       }
     } catch (JsonProcessingException e) {
       logger.debug("websocket notification contains invalid JSON: {}", e.getMessage());
+    } catch (IllegalArgumentException e) {
+      logger.debug("illegal argument in websocket notification: {}", e.getMessage());
     } catch (Exception e) {
       logger.error("failure while processing websocket notification: {}", e.getMessage());
     }
@@ -506,10 +554,11 @@ public class ShellyPro3EM extends Shelly {
   protected Behavior<Command> onOutboundWebsocketConnectionOpened(OutboundWebsocketConnectionOpened message) {
     logger.trace("ShellyPro3EM.onOutboundWebsocketConnectionOpened()");
 
-    logger.debug("outbound websocket connection {} to {} opened", message.connectionId(), message.url());
-
+    logger.info("outbound websocket connection opened to {}", message.url());
+    
     outboundWebsocketAddress = message.remoteAddress();
     outboundWebsocketConnectionId = message.connectionId();
+    outboundWebsocketFailure = false;
 
     return Behaviors.same();
   }
@@ -522,7 +571,13 @@ public class ShellyPro3EM extends Shelly {
   protected Behavior<Command> onOutboundWebsocketConnectionFailed(OutboundWebsocketConnectionFailed message) {
     logger.trace("ShellyPro3EM.onOutboundWebsocketConnectionFailed()");
 
-    logger.debug("outbound websocket connection to {} failed: {}", message.url(), message.failure().getMessage());
+    if (!outboundWebsocketFailure) {
+      logger.error("outbound websocket connection to {} failed: {}", message.url(), message.failure().getMessage());
+      outboundWebsocketFailure = true;
+    } else {
+      logger.debug("outbound websocket connection to {} failed: {}", message.url(), message.failure().getMessage());
+    }
+    
 
     outboundWebsocketAddress = null;
     outboundWebsocketConnectionId = null;
@@ -543,9 +598,7 @@ public class ShellyPro3EM extends Shelly {
   protected Behavior<Command> onRetryOpenOutboundWebsocketConnection(RetryOpenOutboundWebsocketConnection message) {
     logger.trace("ShellyPro3EM.onRetryOpenOutboundWebsocketConnection()");
 
-    if (outboundWebsocketConnectionIsEnabled() && outboundWebsocketConnectionIsClosed()) {
-      startOutboundWebsocketConnection(wsConfig.server().value());
-    }
+    startOutboundWebsocketConnection();
     
     return Behaviors.same();
   }
@@ -592,6 +645,10 @@ public class ShellyPro3EM extends Shelly {
       }
     } catch (JsonProcessingException e) {
       logger.debug("UDP notification contains invalid JSON: {}", e.getMessage());
+    } catch (IllegalArgumentException e) {
+      logger.debug("illegal argument in UDP notification: {}", e.getMessage());
+    } catch (Exception e) {
+      logger.error("failure while processing UDP notification: {}", e.getMessage());
     }
 
     return Behaviors.same();
@@ -739,18 +796,43 @@ public class ShellyPro3EM extends Shelly {
    
   protected Rpc.Response createRpcResult(@NotNull InetAddress remoteAddress,
                                          @NotNull Rpc.Request request) {
-    return switch (request.method()) {
-      case "EM.GetConfig" -> rpcEmGetConfig();
-      case "EM.GetStatus" -> rpcEmGetStatus(getPowerFactorForRemoteAddress(remoteAddress));
-      case "EMData.GetStatus" -> rpcEmDataGetStatus();
-      case "Shelly.GetStatus" -> rpcShellyGetStatus(remoteAddress);
-      case "Shelly.GetDeviceInfo" -> rpcGetDeviceInfo(remoteAddress);
-      case "Shelly.Reboot" -> rpcReboot(remoteAddress);
-      case "Sys.GetConfig" -> rpcSysGetConfig(remoteAddress);
-      case "Ws.GetConfig" -> rpcWsGetConfig();
-      case "Ws.SetConfig" -> rpcWsSetConfig((Rpc.WsSetConfig) request);
+    return switch (request.method().toLowerCase()) {
+      case "cloud.getconfig" -> rpcCloudGetConfig();
+      case "cloud.setconfig" -> rpcCloudSetConfig((Rpc.CloudSetConfig) request);
+      case "em.getconfig" -> rpcEmGetConfig();
+      case "em.getstatus" -> rpcEmGetStatus(getPowerFactorForRemoteAddress(remoteAddress));
+      case "emdata.getstatus" -> rpcEmDataGetStatus();
+      case "shelly.getconfig" -> rpcShellyGetConfig(remoteAddress);
+      case "shelly.getstatus" -> rpcShellyGetStatus(remoteAddress);
+      case "shelly.getdeviceinfo" -> rpcGetDeviceInfo(remoteAddress);
+      case "shelly.reboot" -> rpcReboot(remoteAddress);
+      case "sys.getconfig" -> rpcSysGetConfig(remoteAddress);
+      case "ws.getconfig" -> rpcWsGetConfig();
+      case "ws.setconfig" -> rpcWsSetConfig((Rpc.WsSetConfig) request);
       default -> rpcUnknownMethod(request);
     };
+  }
+
+  /**
+   * Handle the Ws.SetConfig RPC request
+   * @param request Request to set the websocket configuration
+   * @return Response to the request
+   */
+  private Rpc.CloudSetConfigResponse rpcCloudSetConfig(@NotNull Rpc.CloudSetConfig request) {
+    logger.trace("ShellyPro3EM.rpcCloudSetConfig()");
+    
+    logger.debug("setting cloud config {}", request);
+
+    if (request.params() != null) {
+      cloudSetConfig(request.params());
+    }
+
+    return new Rpc.CloudSetConfigResponse(false);
+  }
+  
+  private ShellyConfig rpcShellyGetConfig(@NotNull InetAddress remoteAddress) {
+    logger.trace("Shelly.rpcShellyGetConfig()");
+    return createConfig(remoteAddress);
   }
 
   private Rpc.Response rpcShellyGetStatus(@NotNull InetAddress remoteAddress) {
@@ -785,6 +867,16 @@ public class ShellyPro3EM extends Shelly {
     logger.trace("ShellyPro3EM.rpcReboot()");
     return new Rpc.ShellyRebootResponse();
   }
+
+  /**
+   * Get the cloud configuration
+   * @return Cloud configuration
+   */
+  private Rpc.CloudGetConfigResponse rpcCloudGetConfig() {
+    logger.trace("ShellyPro3EM.rpcCloudGetConfig()");
+    return cloudConfig;
+  }
+  
   
   private Rpc.EmGetConfigResponse rpcEmGetConfig() {
     logger.trace("ShellyPro3EM.rpcEmGetConfig()");
@@ -917,6 +1009,22 @@ public class ShellyPro3EM extends Shelly {
     
     return new Rpc.WsSetConfigResponse(true);
   }
+
+  /**
+   * Set the websocket configuration
+   * @param params Configuration to set
+   */
+  protected void cloudSetConfig(@NotNull Rpc.CloudSetConfigParams params) {
+    logger.trace("ShellyPro3EM.cloudSetConfig()");
+
+    Rpc.CloudSetConfigParamsValues config = params.config();
+    if (config != null) {
+      if (config.enable() != null) {
+        cloudConfig = cloudConfig.withEnable(config.enable());
+      }
+      cloudConfig = cloudConfig.withServer(config.server());
+    }
+  }
   
   /**
    * Set the websocket configuration
@@ -931,9 +1039,7 @@ public class ShellyPro3EM extends Shelly {
     wsConfig = wsConfig.withServer(config.server());
     wsConfig = wsConfig.withSslCa(config.ssl_ca());
     
-    if (outboundWebsocketConnectionIsEnabled()) {
-      startOutboundWebsocketConnection(wsConfig.server().value());
-    }
+    startOutboundWebsocketConnection();
   }
   
   protected boolean outboundWebsocketConnectionIsEnabled() {
@@ -949,6 +1055,24 @@ public class ShellyPro3EM extends Shelly {
 
   protected boolean outboundWebsocketConnectionIsOpen() {
     return outboundWebsocketConnectionId != null;
+  }
+
+  /**
+   * Create the device's status
+   * @return Device's status
+   */
+  private ShellyConfig createConfig(@NotNull InetAddress remoteAddress) {
+    return new ShellyConfig(
+          new Rpc.BleGetConfigResponse(
+                false, 
+                new Rpc.BleGetConfigResponseRpc(true),
+                new Rpc.BleGetConfigResponseObserver(false)),
+          rpcCloudGetConfig(),
+          rpcEmGetConfig(),
+          rpcSysGetConfig(remoteAddress),
+          createWiFiStatus(),
+          rpcWsGetConfig()
+    );
   }
 
   /**
@@ -990,67 +1114,74 @@ public class ShellyPro3EM extends Shelly {
   
   private Rpc.Response rpcUnknownMethod(Rpc.Request request) {
     logger.error("ShellyPro3EM.rpcUnknownMethod()");
-    throw new IllegalArgumentException("Unknown method: " + request.method());
+    throw new IllegalArgumentException("unhandled RPC method '" + request.method() + "'");
   }
 
   /**
    * Start the output websocket connection
-   * @param remoteUrl Remote URL to connect to
    */
-  protected void startOutboundWebsocketConnection(String remoteUrl) {
+  protected void startOutboundWebsocketConnection() {
     logger.trace("ShellyPro3EM.startOutboundWebsocketConnection()");
     
-    String connectionId = UUID.randomUUID().toString();
-    
-    Logger logger = LoggerFactory.getLogger("uni-meter.output.outbound-websocket");
-
-    URI uri = URI.create(remoteUrl);
-
-    InetAddress remoteAddress;
-    try {
-      remoteAddress = InetAddress.getByName(uri.getHost());
-    } catch (Exception e) {
-      getContext().getSelf().tell(new OutboundWebsocketConnectionFailed(remoteUrl, e));
-      return;
-    }
-    
-    final InetAddress finalRemoteAddress = remoteAddress;
-
-    Source<Message, NotUsed> websocketSource = WebsocketOutput.createSource(
-          logger,
-          getMaterializer(),
-          (sourceActor) -> getContext().getSelf().tell(
-                new Shelly.WebsocketOutputOpened(connectionId, finalRemoteAddress, sourceActor))
-    );
-
-    Sink<Message,NotUsed> websocketSink = WebsocketInput.createSink(
-          logger,
-          connectionId,
-          remoteAddress,
-          getMaterializer(),
-          websocketInputNotificationAdapter
-    );
-
-    final Flow<Message, Message, NotUsed> flow =
-          Flow.fromSinkAndSourceMat(websocketSink, websocketSource, Keep.left());
-
-    final Pair<CompletionStage<WebSocketUpgradeResponse>, NotUsed> pair =
-          Http.get(getContext().getSystem()).singleWebSocketRequest(
-                WebSocketRequest.create(remoteUrl), flow, getMaterializer());
-
-    pair.first().whenComplete((upgrade, failure) -> {
-      if (failure != null) {
-        getContext().getSelf().tell(new OutboundWebsocketConnectionFailed(remoteUrl, failure));
-      } else {
-        if (upgrade.response().status().equals(StatusCodes.SWITCHING_PROTOCOLS)) {
-          getContext().getSelf().tell(new OutboundWebsocketConnectionOpened(remoteUrl, remoteAddress, connectionId));
-        } else {
-          getContext().getSelf().tell(new OutboundWebsocketConnectionFailed(
-                remoteUrl,
-                new IllegalStateException("unexpected response status: " + upgrade.response().status())));
+      if (outboundWebsocketConnectionIsEnabled() && outboundWebsocketConnectionIsClosed()) {
+        String remoteUrl =  wsConfig.server().value();
+        try {
+          String connectionId = UUID.randomUUID().toString();
+          
+          Logger logger = LoggerFactory.getLogger("uni-meter.output.outbound-websocket");
+      
+          URI uri = URI.create(remoteUrl);
+      
+          InetAddress remoteAddress;
+          try {
+            remoteAddress = InetAddress.getByName(uri.getHost());
+          } catch (Exception e) {
+            getContext().getSelf().tell(new OutboundWebsocketConnectionFailed(remoteUrl, e));
+            return;
+          }
+          
+          final InetAddress finalRemoteAddress = remoteAddress;
+      
+          Source<Message, NotUsed> websocketSource = WebsocketOutput.createSource(
+                logger,
+                getMaterializer(),
+                (sourceActor) -> getContext().getSelf().tell(
+                      new Shelly.WebsocketOutputOpened(connectionId, finalRemoteAddress, sourceActor))
+          );
+      
+          Sink<Message,NotUsed> websocketSink = WebsocketInput.createSink(
+                logger,
+                connectionId,
+                remoteAddress,
+                getMaterializer(),
+                websocketInputNotificationAdapter
+          );
+      
+          final Flow<Message, Message, NotUsed> flow =
+                Flow.fromSinkAndSourceMat(websocketSink, websocketSource, Keep.left());
+      
+          final Pair<CompletionStage<WebSocketUpgradeResponse>, NotUsed> pair =
+                Http.get(getContext().getSystem()).singleWebSocketRequest(
+                      WebSocketRequest.create(remoteUrl), flow, getMaterializer());
+      
+          pair.first().whenComplete((upgrade, failure) -> {
+            if (failure != null) {
+              getContext().getSelf().tell(new OutboundWebsocketConnectionFailed(remoteUrl, failure));
+            } else {
+              if (upgrade.response().status().equals(StatusCodes.SWITCHING_PROTOCOLS)) {
+                getContext().getSelf().tell(new OutboundWebsocketConnectionOpened(remoteUrl, remoteAddress, connectionId));
+              } else {
+                getContext().getSelf().tell(new OutboundWebsocketConnectionFailed(
+                      remoteUrl,
+                      new IllegalStateException("unexpected response status: " + upgrade.response().status())));
+              }
+            }
+          });
+        } catch (Exception e) {
+          getContext().getSelf().tell(
+                new OutboundWebsocketConnectionFailed(remoteUrl != null ? remoteUrl : "<unknown>", e));
         }
       }
-    });
   }
 
   /**
@@ -1113,6 +1244,11 @@ public class ShellyPro3EM extends Shelly {
     return udpClientContext;
   }
 
+  public record ShellyGetConfig(
+        @JsonProperty("remoteAddress") InetAddress remoteAddress,
+        @JsonProperty("replyTo") ActorRef<ShellyPro3EM.ShellyConfig> replyTo
+  ) implements Command {}
+
   public record ShellyGetDeviceInfo(
         @JsonProperty("remoteAddress") InetAddress remoteAddress,
         @JsonProperty("replyTo") ActorRef<Rpc.GetDeviceInfoResponse> replyTo
@@ -1134,6 +1270,15 @@ public class ShellyPro3EM extends Shelly {
         @JsonProperty("replyTo") ActorRef<Rpc.SysGetConfigResponse> replyTo
   ) implements Command {}
 
+  public record CloudGetConfig(
+        @JsonProperty("replyTo") ActorRef<Rpc.CloudGetConfigResponse> replyTo
+  ) implements Command {}
+
+  public record CloudSetConfig(
+        @JsonProperty("config") Rpc.CloudSetConfigParams config,
+        @JsonProperty("replyTo") ActorRef<Rpc.CloudSetConfigResponse> replyTo
+  ) implements Command {}
+  
   public record EmGetStatus(
         @JsonProperty("remoteAddress") InetAddress remoteAddress,
         @JsonProperty("id") int id,
@@ -1193,6 +1338,16 @@ public class ShellyPro3EM extends Shelly {
   public enum RetryOpenOutboundWebsocketConnection implements Command {
     INSTANCE
   }
+  
+  public record ShellyConfig(
+        @JsonProperty("ble") Rpc.BleGetConfigResponse ble,
+        @JsonProperty("cloud") Rpc.CloudGetConfigResponse cloud,
+        @JsonProperty("em:0") Rpc.EmGetConfigResponse em0,
+        @JsonProperty("sys") Rpc.SysGetConfigResponse sys,
+        @JsonProperty("wifi_sta") WiFiStatus wifi_sta,
+        @JsonProperty("ws") Rpc.WsGetConfigResponse ws
+  ) implements Rpc.Response {}
+  
   
   public enum RetryStartUdpServer implements Command {
     INSTANCE

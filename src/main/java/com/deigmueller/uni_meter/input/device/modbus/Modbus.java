@@ -3,8 +3,6 @@ package com.deigmueller.uni_meter.input.device.modbus;
 import com.deigmueller.uni_meter.input.InputDevice;
 import com.deigmueller.uni_meter.output.OutputDevice;
 import com.digitalpetri.modbus.client.ModbusTcpClient;
-import com.digitalpetri.modbus.pdu.ReadInputRegistersRequest;
-import com.digitalpetri.modbus.pdu.ReadInputRegistersResponse;
 import com.digitalpetri.modbus.tcp.client.NettyTcpClientTransport;
 import com.typesafe.config.Config;
 import lombok.AccessLevel;
@@ -18,6 +16,7 @@ import org.apache.pekko.actor.typed.javadsl.ReceiveBuilder;
 
 import org.jetbrains.annotations.NotNull;
 
+import java.nio.ByteBuffer;
 import java.time.Duration;
 
 @Getter(AccessLevel.PROTECTED)
@@ -25,6 +24,7 @@ public abstract class Modbus extends InputDevice {
   // Instance members
   private final String address = getConfig().getString("address");
   private final int port = getConfig().getInt("port");
+  private final int unitId = getConfig().getInt("unit-id");
   private final Duration pollingInterval = getConfig().getDuration("polling-interval");
   private ModbusTcpClient client;
   
@@ -43,6 +43,7 @@ public abstract class Modbus extends InputDevice {
           .onMessage(NotifyConnectFailed.class, this::onConnectFailed)
           .onMessage(NotifyConnectSucceeded.class, this::onConnectSucceeded)
           .onMessage(ReadInputRegistersFailed.class, this::onReadInputRegistersFailed)
+          .onMessage(ReadHoldingRegistersFailed.class, this::onReadHoldingRegistersFailed)
           .onMessage(StartNextPollingCycle.class, this::onStartNextPollingCycle);
   }
   
@@ -86,42 +87,31 @@ public abstract class Modbus extends InputDevice {
     
     return Behaviors.same();
   }
-  
+
+  protected @NotNull Behavior<Command> onReadHoldingRegistersFailed(@NotNull ReadHoldingRegistersFailed message) {
+    logger.trace("Modbus.onReadHoldingRegistersFailed()");
+
+    logger.error("failed to read holding registers at address {}, quantity {}", message.address(), message.quantity(),
+          message.throwable());
+
+    startNextPollingTimer();
+
+    return Behaviors.same();
+  }
+
   abstract protected @NotNull Behavior<Command> onStartNextPollingCycle(@NotNull StartNextPollingCycle message); 
   
   private void startConnection() {
       try {
         NettyTcpClientTransport transport = NettyTcpClientTransport.create(cfg -> {
-          cfg.hostname = "192.168.178.125";
-          cfg.port = 8899;
+          cfg.hostname = address;
+          cfg.port = port;
         });
 
         ModbusTcpClient client = ModbusTcpClient.create(transport);
+
         client.connect();
 
-        ReadInputRegistersResponse response = client.readInputRegisters(
-              1,
-              new ReadInputRegistersRequest(0 , 2)
-        );
-
-        int asInt = (response.registers()[3] & 0xFF)
-              | ((response.registers()[2] & 0xFF) << 8)
-              | ((response.registers()[1] & 0xFF) << 16)
-              | ((response.registers()[0] & 0xFF) << 24);
-
-        float asFloat = Float.intBitsToFloat(asInt);
-
-        response = client.readInputRegisters(
-              1,
-              new ReadInputRegistersRequest(0x48 , 2)
-        );
-
-        asInt = (response.registers()[3] & 0xFF)
-              | ((response.registers()[2] & 0xFF) << 8)
-              | ((response.registers()[1] & 0xFF) << 16)
-              | ((response.registers()[0] & 0xFF) << 24);
-
-        asFloat = Float.intBitsToFloat(asInt);
         getContext().getSelf().tell(new NotifyConnectSucceeded(client));
       } catch (Exception e) {
         getContext().getSelf().tell(new NotifyConnectFailed(e));
@@ -135,7 +125,7 @@ public abstract class Modbus extends InputDevice {
           getContext().getExecutionContext());
   }
   
-  protected float bytesToFloat(byte[] bytes) {
+  protected static float bytesToFloat(byte[] bytes) {
     int asInt = (bytes[3] & 0xFF)
           | ((bytes[2] & 0xFF) << 8)
           | ((bytes[1] & 0xFF) << 16)
@@ -143,6 +133,17 @@ public abstract class Modbus extends InputDevice {
     
     return Float.intBitsToFloat(asInt);
   }
+  
+  protected static long readUInt32(ByteBuffer buffer) {
+    return (buffer.get() & 0xFFL << 24)
+          | ((buffer.get() & 0xFF) << 16)
+          | ((buffer.get() & 0xFF) << 8)
+          | ((buffer.get() & 0xFF));
+  }
+  
+  protected static void skip(ByteBuffer b, int bytes) {
+    b.position(b.position() + bytes);
+  }  
   
   protected record NotifyConnectSucceeded(
         @NotNull ModbusTcpClient client
@@ -153,6 +154,12 @@ public abstract class Modbus extends InputDevice {
   ) implements Command {}
 
   public record ReadInputRegistersFailed(
+        int address,
+        int quantity,
+        Throwable throwable
+  ) implements Command {}
+
+  public record ReadHoldingRegistersFailed(
         int address,
         int quantity,
         Throwable throwable
